@@ -480,6 +480,12 @@ def finalize_model_grads(
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
+    # 新增：MoEGatedDeltaNet 的 write/read head expert bias 更新
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'update_expert_bias') and module.training:
+                module.update_expert_bias()
+
     reset_model_temporary_tensors(config, model)
 
     # normalize gradients for per-token loss normalization.

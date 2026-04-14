@@ -5,6 +5,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.moe_gated_delta_net import MoEGatedDeltaNet, MoEGatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -74,6 +75,34 @@ def get_gated_delta_net_module_spec(
     return attention
 
 
+def get_moe_gated_delta_net_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for MoE-GatedDeltaNet attention.
+
+    MoEGatedDeltaNet uses separate write/read routers (ColumnParallelLinear with
+    gather_output=True) and fuses in_proj + out_proj with the GDN kernel.
+    The out_norm is embedded directly inside MoEGatedDeltaNet (PerHeadZeroCenteredRMSNorm),
+    so no external out_norm is needed.
+    """
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    attention = ModuleSpec(
+        module=MoEGatedDeltaNet,
+        submodules=MoEGatedDeltaNetSubmodules(
+            in_proj=backend.column_parallel_linear(),
+            out_proj=backend.row_parallel_linear(),
+            writer_router=backend.column_parallel_linear(),
+            read_router=backend.column_parallel_linear(),
+        ),
+        # MoEGatedDeltaNet manages its own input layernorm (fused in in_proj like GDN),
+        # set fuse_input_layernorm=True so TransformerLayer uses IdentityOp for input_layernorm.
+        metainfo={"fuse_input_layernorm": True},
+    )
+    return attention
+
+
 def get_dsa_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -138,6 +167,8 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "moe_gated_delta_net":
+        return get_moe_gated_delta_net_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -284,7 +315,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "moe_gated_delta_net"]
     return experimental_attention_variant in linear_attention_variants
 
 

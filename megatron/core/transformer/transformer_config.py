@@ -262,7 +262,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'moe_gated_delta_net', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
@@ -308,6 +308,29 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    ####################
+    # MoE-GatedDeltaNet
+    ####################
+    linear_num_shared_heads: Optional[int] = None
+    """Number of shared (always-active) heads for MoE-GatedDeltaNet."""
+
+    linear_num_routed_heads: Optional[int] = None
+    """Total size of the routed-head pool for MoE-GatedDeltaNet.
+    Top-k write and read heads are selected from this pool per token."""
+
+    linear_write_topk: Optional[int] = None
+    """Number of top-k heads selected to write (update) the state per token."""
+
+    linear_read_topk: Optional[int] = None
+    """Number of top-k heads selected to read from the state per token."""
+
+    linear_write_coeff_for_read: float = 0.5
+    """Mixing coefficient: read_score = w * write_score + (1-w) * read_score.
+    Controls how much write routing signal influences read routing."""
+
+    linear_moe_router_enable_expert_bias: bool = False
+    """Whether to enable the expert bias in the MoE router for MoE-GatedDeltaNet."""
 
     ####################
     # initialization
@@ -1102,6 +1125,49 @@ class TransformerConfig(ModelParallelConfig):
             assert self.context_parallel_size == 1, (
                 f"Gated delta net does not support context parallel for now,"
                 f" but got {self.context_parallel_size=}."
+            )
+
+        if self.experimental_attention_variant == "moe_gated_delta_net":
+            assert (
+                self.linear_attention_freq is not None
+            ), "linear_attention_freq must be set for moe_gated_delta_net."
+            assert self.linear_key_head_dim is not None, (
+                "linear_key_head_dim must be set for moe_gated_delta_net."
+            )
+            assert self.linear_value_head_dim is not None, (
+                "linear_value_head_dim must be set for moe_gated_delta_net."
+            )
+            assert self.linear_num_shared_heads is not None, (
+                "linear_num_shared_heads must be set for moe_gated_delta_net."
+            )
+            assert self.linear_num_routed_heads is not None, (
+                "linear_num_routed_heads must be set for moe_gated_delta_net."
+            )
+            assert self.linear_write_topk is not None, (
+                "linear_write_topk must be set for moe_gated_delta_net."
+            )
+            assert self.linear_read_topk is not None, (
+                "linear_read_topk must be set for moe_gated_delta_net."
+            )
+            assert self.linear_write_topk <= self.linear_num_routed_heads, (
+                f"linear_write_topk ({self.linear_write_topk}) must be <= "
+                f"linear_num_routed_heads ({self.linear_num_routed_heads})."
+            )
+            assert self.linear_read_topk <= self.linear_num_routed_heads, (
+                f"linear_read_topk ({self.linear_read_topk}) must be <= "
+                f"linear_num_routed_heads ({self.linear_num_routed_heads})."
+            )
+            num_total = self.linear_num_shared_heads + self.linear_num_routed_heads
+            assert num_total % self.tensor_model_parallel_size == 0, (
+                f"linear_num_shared_heads + linear_num_routed_heads ({num_total}) must be "
+                f"divisible by tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+            assert self.linear_num_routed_heads % self.tensor_model_parallel_size == 0, (
+                f"linear_num_routed_heads ({self.linear_num_routed_heads}) must be divisible "
+                f"by tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+            assert self.context_parallel_size == 1, (
+                "MoE-GatedDeltaNet does not support context parallel yet."
             )
 
         if self.fp8:

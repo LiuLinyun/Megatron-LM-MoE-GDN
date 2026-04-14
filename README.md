@@ -1,162 +1,91 @@
-<div align="center">
+# MoE Gated DeltaNet (MoE-GDN)
 
-Megatron-LM and Megatron Core
-=============================
+本分支在 Megatron-LM 中实现了 **MoE Gated DeltaNet**——一种将 Mixture-of-Experts 路由机制引入 Gated Delta Rule 线性注意力的架构变体。核心思想是将线性注意力的多个 head 视为 "专家"，通过 top-k 路由选择性地激活部分 head 进行状态写入和读取，从而在保持线性复杂度的同时大幅扩展模型的状态容量。
 
-<h4>GPU-optimized library for training transformer models at scale</h4>
+## 架构概览
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
-[![version](https://img.shields.io/badge/release-0.15.0-green)](./CHANGELOG.md)
-[![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
+MoE-GDN 层替换 Transformer 中的标准注意力层，其核心设计参考: [Gated Delta Net 及 MoE Gated Delta Net 稀疏化方案](https://zhuanlan.zhihu.com/p/2025182354461696359)
 
-<div align="left">
 
-## About
+### 关键设计
 
-This repository contains two components: **Megatron-LM** and **Megatron Core**.
+1. **Shared Heads + Routed Heads**：总 head 数 = `num_shared_heads` + `num_routed_heads`。Shared heads 始终激活（权重恒为 1），Routed heads 通过 top-k 路由按需激活。
+2. **读写解耦路由**：Write Router 和 Read Router 分别独立路由，支持不同的 top-k 值（`write_topk` / `read_topk`）。读取分数融合了写入分数：`read_score = w * write_score + (1-w) * read_sigmoid`，其中 `w = linear_write_coeff_for_read`，让模型适当更加关注当前写入的状态，避免只从历史信息中提取信息，也要从当前更新的即时信息中提取信息。
+3. **路由写入应该根据写入路由系数考虑写入的”量级”**：将写入系数 alpha，beta 区分开，只对写入系数使用路由系数加权，而不对遗忘系数进行加权，避免长期运行导致状态的尺度急剧缩小，甚至”消失”
+3. **Loss-Free Load Balancing**：可选启用 Expert Bias（`linear_moe_router_enable_expert_bias`），在每个 optimizer step 后基于 token 分配统计更新 bias，无需额外 auxiliary loss。
+4. **Gated Delta Rule**：核心状态更新使用 FLA 库的 `chunk_gated_delta_rule` 高效 kernel，同时提供纯 PyTorch 的确定性回退实现。
+5. **Per-Head Zero-Centered RMSNorm**：输出归一化采用减去均值后再 RMS 归一化的方式，按 head 独立处理。
 
-**Megatron-LM** is a reference example that includes Megatron Core plus pre-configured training scripts. Best for research teams, learning distributed training, and quick experimentation.
+## 配置参数
 
-**Megatron Core** is a composable library with GPU-optimized building blocks for custom training frameworks. It provides transformer building blocks, advanced parallelism strategies (TP, PP, DP, EP, CP), mixed precision support (FP16, BF16, FP8, FP4), and model architectures. Best for framework developers and ML engineers building custom training pipelines.
+在 `TransformerConfig` 中设置以下参数启用 MoE-GDN：
 
-**[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `experimental_attention_variant` | `None` | 设为 `"moe_gated_delta_net"` 启用 |
+| `linear_attention_freq` | `None` | 线性注意力层的频率，如 `4` 表示每 4 层中 3 层为线性注意力、1 层为标准 SDPA |
+| `linear_key_head_dim` | `128` | Q/K 的 head 维度 |
+| `linear_value_head_dim` | `128` | V/Gate 的 head 维度 |
+| `linear_num_shared_heads` | `None` | 始终激活的 shared head 数量 |
+| `linear_num_routed_heads` | `None` | 路由专家池的 head 数量 |
+| `linear_write_topk` | `None` | 状态写入时选择的 top-k head 数 |
+| `linear_read_topk` | `None` | 状态读取时选择的 top-k head 数 |
+| `linear_write_coeff_for_read` | `0.5` | 读取分数中写入分数的融合系数 |
+| `linear_moe_router_enable_expert_bias` | `False` | 是否启用 loss-free load balancing 的 expert bias |
 
-## Getting Started
+### 约束条件
 
-**Install from PyPI:**
+- `write_topk <= num_routed_heads`，`read_topk <= num_routed_heads`
+- `(num_shared_heads + num_routed_heads) % tensor_model_parallel_size == 0`
+- `num_routed_heads % tensor_model_parallel_size == 0`
+- 当前 **不支持** Context Parallelism（`context_parallel_size` 必须为 1）
+
+## 文件结构
+
+```
+megatron/core/ssm/moe_gated_delta_net.py          # 核心模块实现
+megatron/core/transformer/transformer_config.py    # 配置定义与校验
+megatron/core/models/gpt/
+  experimental_attention_variant_module_specs.py    # ModuleSpec 构建与层模式分配
+megatron/core/distributed/finalize_model_grads.py  # Expert bias 梯度后更新
+megatron/training/training.py                      # FLOPs 计算适配
+megatron/training/arguments.py                     # CLI 参数定义
+examples/gdn/pretrain_qwen35_moe_gdn_2b.sh        # 训练脚本示例
+```
+
+## 快速开始
+
+参考 `examples/gdn/pretrain_qwen35_moe_gdn_2b.sh`，关键参数：
 
 ```bash
-uv pip install megatron-core
+LINEAR_ATTN_ARGS=(
+    --experimental-attention-variant moe_gated_delta_net
+    --linear-attention-freq 4
+    --linear-key-head-dim 128
+    --linear-value-head-dim 128
+    --linear-num-shared-heads 4
+    --linear-num-routed-heads 64
+    --linear-write-topk 8
+    --linear-read-topk 16
+    --linear-write-coeff-for-read 0.5
+    --linear-moe-router-enable-expert-bias
+)
 ```
 
-**Or clone and install from source:**
+### 依赖
 
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-uv pip install -e .
-```
+- **flash-linear-attention (FLA)**：`pip install flash-linear-attention`，提供高效的 `chunk_gated_delta_rule` kernel
 
-> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
+## 待优化项 (TODOs)
 
-For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
+1. **QKV EMA Smooth 未启用**
+   - `smooth_qkv` 方法已实现，利用 `A_log` 和 `dt_bias` 参数通过关联扫描进行可学习的 EMA 平滑
+   - 但目前的实现在反向传播的时候没有使用重计算方式，在序列维度会累积巨大的计算图，导致显存爆炸，需要进一步优化
 
-- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
-- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
-- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
+2. **Masking 策略优化**
+   - 当前使用乘法 masking（`query * read_mask`）方案通过将对应的专家输入置为零，实现未激活专家的计算，后续进一步优化需要完全避免未激活专家的计算，包括 gated_delta_rule 内部对于未激活的状态跳过写入或读取
+   - 对于未激活的 head，当前仍然会参与 chunk_gated_delta_rule 的计算（只是输入为零），理想情况下应完全跳过，这部分需要重写 kernel 实现
 
-# Latest News
+3. **序列维度路由负载均衡**
+	- 全局路由负载均衡避免专家整体不被选中，序列路由负载均避免序列维度上长时间不更新或不被读取，成为”死专家”，或者长时间不更新，但突然更新，破坏状态，这一点跟 MLP 还不太一样，MLP 权重是静态的，不会随着序列修改，所以这里必须考虑序列维度的路由负载均衡，目前尚未实现，在验证架构有效之后再进一步优化
 
-- **[2026/03]** **Deprecating Python 3.10 support:** We're officially dropping Python 3.10 support with the upcoming 0.17.0 release. Downstream applications must raise their lower boundary to 3.12 to stay compatible with MCore.
-- **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
-- **[2025/12]** **Megatron Core development has moved to GitHub!** All development and CI now happens in the open. We welcome community contributions.
-- **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - early access branch with experimental features.
-- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
-- **[2025/08]** **[MoE Q3-Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
-- **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions are being integrated into Megatron Core.
-- **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
-- **[2025/05]** Megatron Core v0.11.0 brings new capabilities for multi-data center LLM training ([blog](https://developer.nvidia.com/blog/turbocharge-llm-training-across-long-haul-data-center-networks-with-nvidia-nemo-framework/)).
-
-<details>
-<summary>Previous News</summary>
-
-- **[2024/07]** Megatron Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-Megatron-Core-functionalities/)).
-- **[2024/06]** Megatron Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
-- **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
-
-</details>
-
-# Project Structure
-
-```
-Megatron-LM/
-├── megatron/
-│   ├── core/                    # Megatron Core (kernels, parallelism, building blocks)
-│   │   ├── models/              # Transformer models
-│   │   ├── transformer/         # Transformer building blocks
-│   │   ├── tensor_parallel/     # Tensor parallelism
-│   │   ├── pipeline_parallel/   # Pipeline parallelism
-│   │   ├── distributed/         # Distributed training (FSDP, DDP)
-│   │   ├── optimizer/           # Optimizers
-│   │   ├── datasets/            # Dataset loaders
-│   │   ├── inference/           # Inference engines and server
-│   │   └── export/              # Model export (e.g. TensorRT-LLM)
-│   ├── training/                # Training scripts
-│   ├── legacy/                  # Legacy components
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
-│   └── rl/                      # Reinforcement learning (RLHF, etc.)
-├── examples/                    # Ready-to-use training examples
-├── tools/                       # Utility tools
-├── tests/                       # Comprehensive test suite
-└── docs/                        # Documentation
-```
-
-# Performance Benchmarking
-
-For our latest performance benchmarking results, please refer to [NVIDIA Megatron Bridge Performance Summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html).
-
-Our codebase efficiently trains models from 2B to 462B parameters across thousands of GPUs, achieving up to **47% Model FLOP Utilization (MFU)** on H100 clusters.
-
-![Model table](images/model_table.png)
-
-**Benchmark Configuration:**
-
-- **Vocabulary size**: 131,072 tokens
-- **Sequence length**: 4096 tokens
-- **Model scaling**: Varied hidden size, attention heads, and layers to achieve target parameter counts
-- **Communication optimizations**: Fine-grained overlapping with DP (`--overlap-grad-reduce`, `--overlap-param-gather`), TP (`--tp-comm-overlap`), and PP (enabled by default)
-
-**Key Results:**
-
-- **6144 H100 GPUs**: Successfully benchmarked 462B parameter model training
-- **Superlinear scaling**: MFU increases from 41% to 47-48% with model size
-- **End-to-end measurement**: Throughputs include all operations (data loading, optimizer steps, communication, logging)
-- **Production ready**: Full training pipeline with checkpointing and fault tolerance
-- *Note: Performance results measured without training to convergence*
-
-## Weak Scaling Results
-
-Our weak scaled results show superlinear scaling (MFU increases from 41% for the smallest model considered to 47-48% for the largest models); this is because larger GEMMs have higher arithmetic intensity and are consequently more efficient to execute.
-
-![Weak scaling](images/weak_scaling.png)
-
-## Strong Scaling Results
-
-We also strong scaled the standard GPT-3 model (our version has slightly more than 175 billion parameters due to larger vocabulary size) from 96 H100 GPUs to 4608 GPUs, using the same batch size of 1152 sequences throughout. Communication becomes more exposed at larger scale, leading to a reduction in MFU from 47% to 42%.
-
-![Strong scaling](images/strong_scaling.png)
-
-# Roadmaps
-
-- **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
-
-# Resources
-
-## Getting Help
-
-- 📖 **[Documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** - Official documentation
-- 🐛 **[Issues](https://github.com/NVIDIA/Megatron-LM/issues)** - Bug reports and feature requests
-
-## Contributing
-
-We ❤️ contributions! Ways to contribute:
-
-- 🐛 **Report bugs** - Help us improve reliability
-- 💡 **Suggest features** - Shape the future of Megatron Core
-- 📝 **Improve docs** - Make Megatron Core more accessible
-- 🔧 **Submit PRs** - Contribute code improvements
-
-**→ [Contributing Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)**
-
-## Citation
-
-If you use Megatron in your research or project, we appreciate that you use the following citations:
-
-```bibtex
-@article{megatron-lm,
-  title={Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism},
-  author={Shoeybi, Mohammad and Patwary, Mostofa and Puri, Raul and LeGresley, Patrick and Casper, Jared and Catanzaro, Bryan},
-  journal={arXiv preprint arXiv:1909.08053},
-  year={2019}
-}
-```
