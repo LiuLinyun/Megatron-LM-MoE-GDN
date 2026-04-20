@@ -196,6 +196,7 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.ssm.moe_gated_delta_net import track_moe_gdn_metrics
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -2143,6 +2144,15 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
+
+    # Log MoE-GDN metrics (expert load, routing scores, EMA factors, etc.).
+    track_moe_gdn_metrics(
+        iteration=iteration,
+        writer=writer,
+        wandb_writer=wandb_writer,
+        per_layer_logging=getattr(args, 'moe_per_layer_logging', True),
+        num_layers=args.num_layers,
+    )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:

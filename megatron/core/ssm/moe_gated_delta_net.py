@@ -55,6 +55,128 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MoE-GDN Metrics Tracker (analogous to _MOE_LAYER_WISE_LOGGING_TRACKER)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MOE_GDN_METRICS_TRACKER: dict = {}
+_MOE_GDN_METRICS_COUNT: int = 0
+
+
+def get_moe_gdn_metrics_tracker() -> dict:
+    """Return the global MoE-GDN metrics tracker."""
+    global _MOE_GDN_METRICS_TRACKER
+    return _MOE_GDN_METRICS_TRACKER
+
+
+def save_to_moe_gdn_tracker(
+    name: str,
+    value: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+) -> None:
+    """Save a scalar metric to the per-layer tracker.
+
+    Args:
+        name: Metric name (e.g. "write_score_mean").
+        value: Scalar tensor.
+        layer_number: 1-indexed layer number.
+        num_layers: Total number of layers in the model.
+    """
+    if layer_number is None:
+        return
+    tracker = get_moe_gdn_metrics_tracker()
+    if name not in tracker:
+        tracker[name] = torch.zeros(num_layers, device=value.device)
+    tracker[name][layer_number - 1] += value.detach()
+
+
+def increment_moe_gdn_metrics_count() -> None:
+    """Increment the forward-pass counter (call once per layer per forward)."""
+    global _MOE_GDN_METRICS_COUNT
+    _MOE_GDN_METRICS_COUNT += 1
+
+
+def clear_moe_gdn_tracker() -> None:
+    """Clear all accumulated metrics and reset counter."""
+    global _MOE_GDN_METRICS_COUNT
+    tracker = get_moe_gdn_metrics_tracker()
+    for name in tracker:
+        if isinstance(tracker[name], torch.Tensor):
+            tracker[name].zero_()
+    _MOE_GDN_METRICS_COUNT = 0
+
+
+def track_moe_gdn_metrics(
+    iteration: int,
+    writer=None,
+    wandb_writer=None,
+    per_layer_logging: bool = True,
+    num_layers: int = None,
+) -> None:
+    """Reduce and log MoE-GDN metrics to TensorBoard / WandB.
+
+    Should be called at logging intervals from the training loop.
+
+    Args:
+        iteration: Current training iteration.
+        writer: TensorBoard SummaryWriter (or None).
+        wandb_writer: WandB run object (or None).
+        per_layer_logging: Whether to log per-layer breakdown (default True).
+        num_layers: Total number of layers (for averaging).
+    """
+    tracker = get_moe_gdn_metrics_tracker()
+    if not tracker:
+        return
+
+    # Reduce across PP ranks so every rank sees the full picture
+    try:
+        from megatron.core import parallel_state
+
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        for name in tracker:
+            if isinstance(tracker[name], torch.Tensor):
+                torch.distributed.all_reduce(tracker[name], group=pp_group)
+    except Exception:
+        pass
+
+    if writer is None and wandb_writer is None:
+        clear_moe_gdn_tracker()
+        return
+
+    global _MOE_GDN_METRICS_COUNT
+    num_moe_layers = num_layers or 1
+    # Number of forward passes accumulated since last clear
+    count = max(_MOE_GDN_METRICS_COUNT, 1)
+    for name, values in tracker.items():
+        if not isinstance(values, torch.Tensor):
+            continue
+        # Divide by accumulation count to get true per-forward-pass average
+        avg_values = values / count
+        avg_value = avg_values.sum().item() / num_moe_layers
+
+        if writer is not None:
+            writer.add_scalar(f"moe_gdn/{name}", avg_value, iteration)
+            if per_layer_logging:
+                for i, v in enumerate(avg_values.tolist()):
+                    # Use "moe_gdn_per_layer/{name}/layer_XX" so TensorBoard
+                    # groups all layers of the same metric into one chart.
+                    writer.add_scalar(
+                        f"moe_gdn_per_layer/{name}/layer_{i:02d}", v, iteration
+                    )
+        if wandb_writer is not None:
+            wandb_writer.log({f"moe_gdn/{name}": avg_value}, iteration)
+            if per_layer_logging:
+                wandb_writer.log(
+                    {
+                        f"moe_gdn_per_layer/{name}/layer_{i:02d}": v
+                        for i, v in enumerate(avg_values.tolist())
+                    },
+                    iteration,
+                )
+
+    clear_moe_gdn_tracker()
+
 
 class PerHeadZeroCenteredRMSNorm(torch.nn.Module):
     def __init__(
@@ -112,6 +234,8 @@ class MoEGatedDeltaNet(MegatronModule):
         submodules: MoEGatedDeltaNetSubmodules,
         layer_number: int = None,
         bias: bool = False,
+        conv_bias: bool = False,
+        conv_init: Optional[float] = None,
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
@@ -140,6 +264,8 @@ class MoEGatedDeltaNet(MegatronModule):
         # Attributes from arguments
         self.layer_number = layer_number
         self.bias = bias
+        self.conv_bias = conv_bias
+        self.conv_init = conv_init
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
@@ -153,18 +279,29 @@ class MoEGatedDeltaNet(MegatronModule):
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
-        # self.conv_kernel_dim = config.linear_conv_kernel_dim
+        self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.query_key_dim = config.linear_key_head_dim
         self.value_dim = config.linear_value_head_dim
-        self.num_shared_heads = config.linear_num_shared_heads # TODO
-        self.num_routed_heads = config.linear_num_routed_heads # TODO
+        self.num_shared_heads = config.linear_num_shared_heads 
+        self.num_routed_heads = config.linear_num_routed_heads 
         self.num_total_heads = self.num_shared_heads + self.num_routed_heads
         self.num_heads_local_tp = self.num_total_heads // self.tp_size
+        self.num_shared_heads_local_tp = self.num_shared_heads // self.tp_size
+        self.num_routed_heads_local_tp = self.num_routed_heads // self.tp_size
         self.qk_dim = self.query_key_dim * self.num_total_heads
         self.v_dim = self.value_dim * self.num_total_heads
         self.write_topk = config.linear_write_topk
         self.read_topk = config.linear_read_topk
         self.write_coeff_for_read = getattr(config, 'linear_write_coeff_for_read', 0.5)
+        # Control whether write_score gates alpha (decay) and beta (update):
+        #   'none'  — no score gating on alpha/beta (binary mask only)
+        #   'beta'  — score gates beta only; alpha uses binary mask
+        #   'both'  — score gates both alpha and beta (method B: linear in retention space)
+        self.score_gate_mode = getattr(config, 'linear_score_gate_mode', 'both')
+        # Score rescaling (read path only): rescale selected read scores so their
+        # per-token sum = read_topk, ensuring average ≈ 1.0 (aligned with shared experts).
+        # Write scores stay as raw sigmoid ∈ [0,1], safe for retention formula.
+        self.score_rescale = getattr(config, 'linear_score_rescale', True)
 
         # self.write_router = build_module(
         #     submodules.writer_router,
@@ -279,13 +416,50 @@ class MoEGatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
+        
+
+        self.use_qkv_conv = True
+        self.only_shared_qkv_conv = True
+        self.use_qkv_ema_smooth = False
+
+        if self.use_qkv_conv:
+            if self.only_shared_qkv_conv:
+                # Combined qkv conv for shared heads only
+                self.conv_dim_local_tp = (self.query_key_dim * 2 + self.value_dim) * self.num_shared_heads_local_tp
+            else:
+                # Conv1d for QKV (depthwise, per-channel)
+                # Channel layout: [q_all_heads | kv_all_heads]
+                self.q_conv_dim = self.query_key_dim * self.num_heads_local_tp
+                self.kv_conv_dim = (self.query_key_dim + self.value_dim) * self.num_heads_local_tp
+                self.conv_dim_local_tp = self.q_conv_dim + self.kv_conv_dim
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=conv_bias,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
+            if conv_bias:
+                setattr(self.conv1d.bias, "tensor_model_parallel", True)
+                setattr(self.conv1d.bias, "partition_dim", 0)
+
 
         # Time step projection (discretization)
         # A_log and dt_bias 除了用于 alpha 计算外，还用于计算 qkv 的 EMA 可学习的平滑系数
         # dt_bias parameter
+        if self.use_qkv_ema_smooth:
+            smooth_param_cnt = 4
+        else:
+            smooth_param_cnt = 1
+        
         self.dt_bias = nn.Parameter(
             torch.empty(
-                (self.num_heads_local_tp, 4),
+                (self.num_heads_local_tp, smooth_param_cnt),
                 dtype=config.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -295,7 +469,7 @@ class MoEGatedDeltaNet(MegatronModule):
         # A_log parameter
         self.A_log = nn.Parameter(
             torch.empty(
-                (self.num_heads_local_tp, 4),
+                (self.num_heads_local_tp, smooth_param_cnt),
                 dtype=config.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -334,16 +508,21 @@ class MoEGatedDeltaNet(MegatronModule):
         """Reset the parameters."""
         if self.config.perform_initialization:
             with get_cuda_rng_tracker().fork():
+                # conv1d.weight
+                if self.use_qkv_conv:
+                    if self.conv_init is not None:
+                        nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 # dt_bias
+                smooth_param_cnt = 1 if not self.use_qkv_ema_smooth else 4
                 torch.ones(
-                    (self.num_heads_local_tp, 4),
+                    (self.num_heads_local_tp, smooth_param_cnt),
                     out=self.dt_bias.data,
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 )
                 # A_log
                 A = torch.empty(
-                    (self.num_heads_local_tp, 4),
+                    (self.num_heads_local_tp, smooth_param_cnt),
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
@@ -384,23 +563,27 @@ class MoEGatedDeltaNet(MegatronModule):
         _, write_topk_indices = torch.topk(
             write_scores_for_routing, self.write_topk, dim=-1, largest=True, sorted=True
         )  # [bsz, seq_len, write_topk]
-        # Weights: gather from UNBIASED sigmoid scores
-        write_weight = torch.gather(write_scores, dim=-1, index=write_topk_indices)
 
         _, read_topk_indices = torch.topk(
             read_scores_for_routing, self.read_topk, dim=-1, largest=True, sorted=True
         )  # [bsz, seq_len, read_topk]
-        read_weight = torch.gather(read_scores, dim=-1, index=read_topk_indices)
 
-        # Boolean selection masks: [s, b, num_routed_heads]
+        # Boolean selection masks: [bsz, seq_len, num_routed_heads]
         write_mask = torch.zeros_like(write_scores, dtype=torch.bool)
         write_mask.scatter_(-1, write_topk_indices, True)
 
         read_mask = torch.zeros_like(read_scores, dtype=torch.bool)
         read_mask.scatter_(-1, read_topk_indices, True)
 
-        
-        
+        # Rescale read scores so per-token sum of selected = read_topk
+        # (average ≈ 1.0 per expert, aligned with shared experts).
+        # Write scores are kept as raw sigmoid ∈ [0,1] — safe for retention formula
+        # in score_gate_mode='both': retention = 1 - score*(1-exp(α)).
+        if self.score_rescale:
+            read_weight = torch.gather(read_scores, dim=-1, index=read_topk_indices)
+            read_scale = self.read_topk / read_weight.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            read_scores = read_scores * read_scale
+
         # ── Extract current TP rank's local routing scores and masks ──────────
         # ColumnParallelLinear (gather_output=False) assigns heads contiguously:
         # rank r owns global head indices [r*H, (r+1)*H), H = num_routed_heads // tp_size
@@ -413,7 +596,7 @@ class MoEGatedDeltaNet(MegatronModule):
         write_mask_local = write_mask[..., local_start:local_end]
         read_mask_local  = read_mask[..., local_start:local_end]
 
-        # Local routing weights (unbiased sigmoid, zeroed for non-selected heads)
+        # Local routing weights (rescaled if enabled, masked to selected experts)
         # Shape: [b, s, heads_per_rank]
         write_weight_local = (
             write_scores[..., local_start:local_end].type_as(hidden_states)
@@ -435,9 +618,12 @@ class MoEGatedDeltaNet(MegatronModule):
                 )
 
         # cat shared expert scores
+        device, dtype = write_weight_local.device, write_weight_local.dtype
         local_shared_heads = self.num_shared_heads // self.tp_size
-        local_shared_weights = torch.ones((bsz, seq_len, local_shared_heads), device=write_weight_local.device, dtype=write_weight_local.dtype)
-        local_shared_masks = torch.ones((bsz, seq_len, local_shared_heads), device=read_mask_local.device, dtype=read_mask_local.dtype)
+        # local_shared_weights = (1.0 / self.num_shared_heads) * torch.ones((bsz, seq_len, local_shared_heads), device=device, dtype=dtype)
+        local_shared_weights = torch.ones((bsz, seq_len, local_shared_heads), device=device, dtype=dtype)
+
+        local_shared_masks = torch.ones((bsz, seq_len, local_shared_heads), device= device, dtype=read_mask_local.dtype)
 
         write_weight_local = torch.cat([local_shared_weights, write_weight_local], dim=-1)
         read_weight_local = torch.cat([local_shared_weights, read_weight_local], dim=-1)
@@ -502,13 +688,17 @@ class MoEGatedDeltaNet(MegatronModule):
         bsz, seq_len, local_heads = alpha.shape
         A = self.A_log.float().exp()
         b = self.dt_bias.float()
-        alpha_log = -A[:, 0] * F.softplus(alpha.float() + b[:, 0])
         beta = beta.sigmoid()
-        qkv_smooth_factor = torch.exp(-A[:, 1:] * F.softplus(b[:, 1:]))
+        if self.use_qkv_ema_smooth:
+            alpha_log = -A[:, 0] * F.softplus(alpha.float() + b[:, 0])
+            qkv_smooth_factor = torch.exp(-A[:, 1:] * F.softplus(b[:, 1:]))
+        else:
+            alpha_log = -A.squeeze(-1) * F.softplus(alpha.float() + b.squeeze(-1))
+            qkv_smooth_factor = None
         return alpha_log, beta, qkv_smooth_factor
 
 
-    def smooth_qkv(self, query, key, value, qkv_smooth_factor, write_mask, read_mask):
+    def smooth_qkv_bak(self, query, key, value, qkv_smooth_factor, write_mask, read_mask):
         """
         Smooth QKV
         Args:
@@ -523,12 +713,199 @@ class MoEGatedDeltaNet(MegatronModule):
             key: [bsz, seq_len, local_heads, qk_dim]
             value: [bsz, seq_len, local_heads, v_dim]
         """
-        query = ema_smooth_scan(query, qkv_smooth_factor[:,0], read_mask)
-        key = ema_smooth_scan(key, qkv_smooth_factor[:,1], write_mask)
-        value = ema_smooth_scan(value, qkv_smooth_factor[:,2], write_mask)
+        bsz, seq_len, q_heads, qk_dim = query.shape
+        _, _, v_heads, v_dim = value.shape
+        if qk_dim == v_dim:
+            qkv = torch.cat([query, key, value], dim=-2) # [bsz, seq_len, 3*local_heads, qk_dim]
+            masks = torch.cat([read_mask, write_mask, write_mask], dim=-1)
+            factor = qkv_smooth_factor.transpose(-1, -2).flatten() # [3*local_heads]
+            qkv = ema_smooth(qkv, factor, masks)
+            query, key, value = torch.split(qkv, [q_heads, q_heads, v_heads], dim=-2)
+        else:
+            query = ema_smooth(query, qkv_smooth_factor[:,0], read_mask)
+            key = ema_smooth(key, qkv_smooth_factor[:,1], write_mask)
+            value = ema_smooth(value, qkv_smooth_factor[:,2], write_mask)
         return query, key, value
 
-    
+    def _apply_dense_causal_conv1d(self, x, conv_weight, conv_bias=None):
+        """Apply causal conv1d on all positions.
+
+        Args:
+            x: [bsz, seq_len, heads, dim]
+            conv_weight: [heads*dim, 1, kernel_size] depthwise conv weights
+            conv_bias: [heads*dim] or None
+        Returns:
+            y: [bsz, seq_len, heads, dim]
+        """
+        bsz, seq_len, heads, dim = x.shape
+
+        # Reshape: [bsz, seq_len, heads, dim] -> [bsz, heads*dim, seq_len]
+        x_conv = x.transpose(1, 2).reshape(bsz, heads * dim, seq_len)
+
+        nvtx_range_push(suffix="dense_conv1d")
+        if (causal_conv1d_fn is not None) and (not self.config.deterministic_mode):
+            assert self.activation in ["silu", "swish"]
+            x_conv = causal_conv1d_fn(
+                x=x_conv,
+                weight=conv_weight.squeeze(1),  # [heads*dim, kernel_size]
+                bias=conv_bias,
+                activation=self.activation,
+            )
+        else:
+            x_conv = self.act_fn(
+                F.conv1d(
+                    x_conv, conv_weight, conv_bias,
+                    padding=conv_weight.shape[-1] - 1,
+                    groups=heads * dim,
+                )[..., :seq_len]
+            )
+        nvtx_range_pop(suffix="dense_conv1d")
+
+        # Reshape back: [bsz, heads*dim, seq_len] -> [bsz, seq_len, heads, dim]
+        x_conv = x_conv.reshape(bsz, heads, dim, seq_len).permute(0, 3, 1, 2)
+
+        return x_conv
+        
+
+    def _apply_sparse_causal_conv1d(self, x, mask, conv_weight, conv_bias=None):
+        """Apply causal conv1d only on active (masked) positions.
+
+        Algorithm:
+          1. Stable-sort tokens so that active (mask=True) come first while
+             preserving their relative order.
+          2. Apply depthwise causal conv1d on the sorted sequence.
+             Since active tokens are contiguous at the front and the conv is
+             causal, each active position's receptive field contains only
+             other active tokens.
+          3. Inverse-sort to restore the original token order.
+
+        Args:
+            x: [bsz, seq_len, heads, dim]
+            mask: [bsz, seq_len, heads] bool, True = active
+            conv_weight: [heads*dim, 1, kernel_size] depthwise conv weights
+            conv_bias: [heads*dim] or None
+        Returns:
+            y: [bsz, seq_len, heads, dim]
+        """
+        bsz, seq_len, heads, dim = x.shape
+
+        # Transpose to [bsz, heads, seq_len, dim] and [bsz, heads, seq_len]
+        x_bh = x.transpose(1, 2)       # [bsz, heads, seq_len, dim]
+        mask_bh = mask.transpose(1, 2)  # [bsz, heads, seq_len]
+
+        # Stable sort: active tokens first (0), inactive after (1)
+        sort_keys = (~mask_bh).long()
+        sorted_indices = sort_keys.argsort(dim=-1, stable=True)  # [bsz, heads, seq_len]
+
+        # Gather x in sorted order
+        gather_idx = sorted_indices.unsqueeze(-1).expand(-1, -1, -1, dim)
+        x_sorted = torch.gather(x_bh, 2, gather_idx)  # [bsz, heads, seq_len, dim]
+
+        # Reshape for conv1d: [bsz, heads*dim, seq_len]
+        x_conv = x_sorted.reshape(bsz, heads * dim, seq_len)
+
+        # Apply causal conv1d with activation
+        nvtx_range_push(suffix="sparse_conv1d")
+        if (causal_conv1d_fn is not None) and (not self.config.deterministic_mode):
+            assert self.activation in ["silu", "swish"]
+            x_conv = causal_conv1d_fn(
+                x=x_conv,
+                weight=conv_weight.squeeze(1),  # [heads*dim, kernel_size]
+                bias=conv_bias,
+                activation=self.activation,
+            )
+        else:
+            x_conv = self.act_fn(
+                F.conv1d(
+                    x_conv, conv_weight, conv_bias,
+                    padding=conv_weight.shape[-1] - 1,
+                    groups=heads * dim,
+                )[..., :seq_len]
+            )
+        nvtx_range_pop(suffix="sparse_conv1d")
+
+        # Reshape back: [bsz, heads, seq_len, dim]
+        x_conv = x_conv.reshape(bsz, heads, seq_len, dim)
+
+        # Unsort: inverse permutation to restore original order
+        inv_indices = sorted_indices.argsort(dim=-1)
+        inv_gather_idx = inv_indices.unsqueeze(-1).expand(-1, -1, -1, dim)
+        x_out = torch.gather(x_conv, 2, inv_gather_idx)
+
+        # Transpose back: [bsz, seq_len, heads, dim]
+        x_out = x_out.transpose(1, 2)
+
+        return x_out
+
+    def smooth_qkv(self, query, key, value, qkv_smooth_factor, write_mask, read_mask):
+        """Apply causal conv1d on QKV.
+
+        q is convolved over positions selected by read_mask,
+        k and v are convolved over positions selected by write_mask.
+        Activation (SiLU) is fused inside the conv.
+
+        Args:
+            query: [bsz, seq_len, local_heads, qk_dim]
+            key: [bsz, seq_len, local_heads, qk_dim]
+            value: [bsz, seq_len, local_heads, v_dim]
+            qkv_smooth_factor: unused (kept for API compat)
+            write_mask: [bsz, seq_len, local_heads]
+            read_mask: [bsz, seq_len, local_heads]
+        Returns:
+            query, key, value with the same shapes, after sparse conv + activation.
+        """
+        if not self.use_qkv_conv:
+            return query, key, value
+
+        if self.only_shared_qkv_conv:
+            S = self.num_shared_heads_local_tp
+
+            # -- Shared heads: combined qkv dense conv + fused activation --
+            qkv_shared = torch.cat([
+                query[:, :, :S, :], key[:, :, :S, :], value[:, :, :S, :]
+            ], dim=-1)  # [bsz, seq_len, S, 2*qk_dim + v_dim]
+
+            conv_weight = self.conv1d.weight
+            conv_bias = self.conv1d.bias if self.conv_bias else None
+            qkv_shared = self._apply_dense_causal_conv1d(qkv_shared, conv_weight, conv_bias)
+
+            q_shared, k_shared, v_shared = qkv_shared.split(
+                [self.query_key_dim, self.query_key_dim, self.value_dim], dim=-1
+            )
+
+            # -- Routed heads: activation only, masked --
+            q_routed = query[:, :, S:, :]
+            k_routed = key[:, :, S:, :]
+            v_routed = value[:, :, S:, :]
+
+            read_mask_routed = read_mask[:, :, S:].unsqueeze(-1)   # [bsz, seq_len, routed, 1]
+            write_mask_routed = write_mask[:, :, S:].unsqueeze(-1)
+
+            q_routed = self.act_fn(q_routed) * read_mask_routed
+            k_routed = self.act_fn(k_routed) * write_mask_routed
+            v_routed = self.act_fn(v_routed) * write_mask_routed
+
+            # -- Reassemble [shared | routed] --
+            query = torch.cat([q_shared, q_routed], dim=2)
+            key = torch.cat([k_shared, k_routed], dim=2)
+            value = torch.cat([v_shared, v_routed], dim=2)
+        else:
+            # Slice conv weights: layout is [q_channels | k_channels | v_channels]
+            # Sparse conv on q with read_mask
+            q_weight = self.conv1d.weight[:self.q_conv_dim]
+            kv_weight = self.conv1d.weight[self.q_conv_dim:]
+            q_bias = self.conv1d.bias[:self.q_conv_dim] if self.conv_bias else None
+            kv_bias = self.conv1d.bias[self.q_conv_dim:] if self.conv_bias else None
+
+            query = self._apply_sparse_causal_conv1d(query, read_mask, q_weight, q_bias)
+
+            # Sparse conv on k,v with write_mask (batch them along dim axis)
+            kv = torch.cat([key, value], dim=-1)  # [bsz, seq_len, heads, qk_dim+v_dim]
+            kv = self._apply_sparse_causal_conv1d(kv, write_mask, kv_weight, kv_bias)
+            key, value = kv.split([self.query_key_dim, self.value_dim], dim=-1)
+
+        return query, key, value
+
     def forward_state_update_read(self, query, key, value, alpha, beta, write_mask, read_mask):
         """
         Forward pass for the state update read component using the Gated Delta Rule.
@@ -584,12 +961,111 @@ class MoEGatedDeltaNet(MegatronModule):
         gate = self.act_fn(gate) * read_score.unsqueeze(-1)
         # gate.masked_fill_(read_mask.unsqueeze(-1) == 0, 0.0)
         core_attn_out = self.out_norm(core_attn_out) 
-        out = core_attn_out * gate
+        out = core_attn_out * gate * read_mask.unsqueeze(-1)
         # out = out.masked_fill(read_mask.unsqueeze(-1) == 0, 0.0)
-        out = out * read_mask.unsqueeze(-1)
         out = out.reshape(bsz, seq_len, -1) # [bsz, seq_len, local_heads*value_dim]
         output, output_bias = self.out_proj(out) # tp AllReduce here
         return output.transpose(0, 1), output_bias  # output: [seq_len, bsz, hidden_size]; bias: [hidden_size] or None
+
+    @torch.no_grad()
+    def _collect_metrics(
+        self,
+        write_score: torch.Tensor,
+        write_mask: torch.Tensor,
+        read_score: torch.Tensor,
+        read_mask: torch.Tensor,
+        alpha_log: torch.Tensor,
+        beta: torch.Tensor,
+        qkv_smooth_factor: torch.Tensor,
+    ) -> None:
+        """Collect monitoring metrics for TensorBoard during training.
+
+        Only runs when grad is enabled (training, non-recompute) to avoid
+        double-counting with activation checkpointing.
+
+        Tracked metrics (all per-layer, reduced across layers at log time):
+          - Expert load: tokens per head, CoV, max/min ratio
+          - Routing scores: mean, std of sigmoid scores
+          - Expert bias: mean, std, min, max (when bias is enabled)
+          - EMA smooth factors: per-dimension (q/k/v) values
+          - Alpha/Beta gate: mean, std of gate values
+          - A_log/dt_bias: mean, std of learnable parameters
+        """
+        num_layers = self.config.num_layers
+        layer = self.layer_number
+
+        # ── 1. Expert load (from routing masks, routed heads only) ────────
+        # write_mask/read_mask include shared heads; strip them
+        local_shared = self.num_shared_heads // self.tp_size
+        w_mask_routed = write_mask[..., local_shared:]  # [b, s, routed_local]
+        r_mask_routed = read_mask[..., local_shared:]
+
+        w_tokens = w_mask_routed.float().sum(dim=(0, 1))  # [routed_local]
+        r_tokens = r_mask_routed.float().sum(dim=(0, 1))
+
+        for prefix, tokens in [("write", w_tokens), ("read", r_tokens)]:
+            mean_t = tokens.mean()
+            std_t = tokens.std()
+            save_to_moe_gdn_tracker(f"{prefix}_load_mean", mean_t, layer, num_layers)
+            # Coefficient of Variation (higher = more imbalanced)
+            cv = std_t / (mean_t + 1e-8)
+            save_to_moe_gdn_tracker(f"{prefix}_load_cv", cv, layer, num_layers)
+            # Max / min ratio
+            max_min_ratio = tokens.max() / (tokens.min() + 1e-8)
+            save_to_moe_gdn_tracker(f"{prefix}_load_max_min_ratio", max_min_ratio, layer, num_layers)
+
+        # ── 2. Routing scores (unbiased sigmoid, routed heads only) ───────
+        w_scores_routed = write_score[..., local_shared:]  # [b, s, routed_local]
+        r_scores_routed = read_score[..., local_shared:]
+
+        for prefix, scores, mask in [
+            ("write_score", w_scores_routed, w_mask_routed),
+            ("read_score", r_scores_routed, r_mask_routed),
+        ]:
+            # Mean/std over SELECTED experts only (exclude zeros from unselected)
+            selected = scores[mask]
+            if selected.numel() > 0:
+                save_to_moe_gdn_tracker(
+                    f"{prefix}_mean", selected.mean(), layer, num_layers
+                )
+                save_to_moe_gdn_tracker(
+                    f"{prefix}_std", selected.std(), layer, num_layers
+                )
+
+        # ── 3. Expert bias (when enabled) ─────────────────────────────────
+        if self.enable_expert_bias:
+            for prefix, bias in [
+                ("write_bias", self.write_expert_bias),
+                ("read_bias", self.read_expert_bias),
+            ]:
+                save_to_moe_gdn_tracker(f"{prefix}_mean", bias.mean(), layer, num_layers)
+                save_to_moe_gdn_tracker(f"{prefix}_std", bias.std(), layer, num_layers)
+                save_to_moe_gdn_tracker(f"{prefix}_min", bias.min(), layer, num_layers)
+                save_to_moe_gdn_tracker(f"{prefix}_max", bias.max(), layer, num_layers)
+
+        # ── 4. EMA smooth factors (per q/k/v dimension) ──────────────────
+        # qkv_smooth_factor: [local_heads, 3], values in (0, 1); None when EMA is disabled
+        if qkv_smooth_factor is not None:
+            for i, dim_name in enumerate(["q", "k", "v"]):
+                factor_i = qkv_smooth_factor[:, i]
+                save_to_moe_gdn_tracker(
+                    f"ema_smooth_{dim_name}_mean", factor_i.mean(), layer, num_layers
+                )
+                save_to_moe_gdn_tracker(
+                    f"ema_smooth_{dim_name}_std", factor_i.std(), layer, num_layers
+                )
+
+        # ── 5. Alpha (decay gate) and Beta (update gate) statistics ──────
+        save_to_moe_gdn_tracker("alpha_log_mean", alpha_log.mean(), layer, num_layers)
+        save_to_moe_gdn_tracker("alpha_log_std", alpha_log.std(), layer, num_layers)
+        save_to_moe_gdn_tracker("beta_mean", beta.mean(), layer, num_layers)
+        save_to_moe_gdn_tracker("beta_std", beta.std(), layer, num_layers)
+
+        # ── 6. Learnable parameters A_log and dt_bias ────────────────────
+        save_to_moe_gdn_tracker("A_log_mean", self.A_log.data.mean(), layer, num_layers)
+        save_to_moe_gdn_tracker("A_log_std", self.A_log.data.std(), layer, num_layers)
+        save_to_moe_gdn_tracker("dt_bias_mean", self.dt_bias.data.mean(), layer, num_layers)
+        save_to_moe_gdn_tracker("dt_bias_std", self.dt_bias.data.std(), layer, num_layers)
 
     def forward(self, *args, **kwargs):
         # with torch.autograd.detect_anomaly():
@@ -636,13 +1112,8 @@ class MoEGatedDeltaNet(MegatronModule):
         # alpha_log = alpha_log.masked_fill(write_mask == 0, 0.0)
         # beta = beta.masked_fill(write_mask == 0, 0.0)
 
-        # smooth qkv
-        # query, key, value = self.smooth_qkv(query, key, value, qkv_smooth_factor, write_mask, read_mask)
-
-        # SiLU  for qkv
-        query = self.act_fn(query)
-        key = self.act_fn(key)
-        value = self.act_fn(value)
+        # sparse conv + activation (SiLU fused) for qkv
+        query, key, value = self.smooth_qkv(query, key, value, qkv_smooth_factor, write_mask, read_mask)
         
 
         # L2 norm for qk, but not v
@@ -663,8 +1134,31 @@ class MoEGatedDeltaNet(MegatronModule):
         key = key * write_mask.unsqueeze(-1)
         value = value * write_mask.unsqueeze(-1)
         gate = gate * read_mask.unsqueeze(-1)
-        alpha_log = alpha_log * write_mask
-        beta = beta * write_mask
+
+        if self.score_gate_mode == 'none':
+            alpha_log = alpha_log * write_mask
+            beta = beta * write_mask
+        elif self.score_gate_mode == 'beta':
+            alpha_log = alpha_log * write_mask
+            beta = beta * write_mask * write_score
+        elif self.score_gate_mode == 'both':  # 'both' — method B: linear interpolation in retention space
+            # retention = 1 - score * (1 - exp(alpha_log))
+            # alpha_log_eff = log(retention)
+            base_retention = alpha_log.float().exp()
+            effective_retention = (1.0 - write_score.float() * (1.0 - base_retention)).clamp(min=1e-6)
+            alpha_log = effective_retention.log().type_as(alpha_log) * write_mask
+            beta = beta * write_mask * write_score
+        else:
+            raise ValueError(f"Unknown score_gate_mode {self.score_gate_mode}")
+
+        # Collect monitoring metrics (training only, skip recompute)
+        if self.training and torch.is_grad_enabled():
+            if self.layer_number == 1:
+                increment_moe_gdn_metrics_count()
+            self._collect_metrics(
+                write_score, write_mask, read_score, read_mask,
+                alpha_log, beta, qkv_smooth_factor,
+            )
 
         # State Update Read
         core_attn_out, last_recurrent_state = self.forward_state_update_read(
@@ -698,9 +1192,37 @@ class MoEGatedDeltaNet(MegatronModule):
         # Submodules
         tp_group = tp_group if tp_group is not None else self.pg_collection.tp
         for name, module in self.named_children():
-            module_sharded_sd = sharded_state_dict_default(
-                module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group
-            )
+            if name == "conv1d":
+                # nn.Conv1d is a plain PyTorch module without sharded_state_dict;
+                # must explicitly specify TP sharding on dim 0.
+                module_sd = module.state_dict(prefix="", keep_vars=True)
+                tp_sharding_map = {"weight": 0}
+                if self.conv_bias:
+                    tp_sharding_map["bias"] = 0
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd,
+                    f"{prefix}{name}.",
+                    tp_sharding_map,
+                    sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            elif name == "out_norm":
+                # PerHeadZeroCenteredRMSNorm is a plain nn.Module with TP-sharded
+                # weight on dim 0; must explicitly specify TP sharding.
+                module_sd = module.state_dict(prefix="", keep_vars=True)
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {"weight": 0},
+                    sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            else:
+                module_sharded_sd = sharded_state_dict_default(
+                    module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group
+                )
             sharded_state_dict.update(module_sharded_sd)
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
@@ -730,11 +1252,17 @@ class MoEGatedDeltaNet(MegatronModule):
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""
         self._backward_in_proj()
+        self._backward_routers()
         self._backward_out_proj()
 
     def _backward_in_proj(self):
         """Computes weight gradients of input projection layer."""
         self.in_proj.backward_dw()
+
+    def _backward_routers(self):
+        """Computes weight gradients of write/read router layers."""
+        self.write_router.backward_dw()
+        self.read_router.backward_dw()
 
     def _backward_out_proj(self):
         """Computes weight gradients of output projection layer."""
@@ -768,6 +1296,13 @@ class MoEGatedDeltaNet(MegatronModule):
                 # Update only the local TP slice of the global expert_bias buffer
                 expert_bias[local_start:local_start + heads_per_rank].add_(
                     torch.sign(offset) * self.expert_bias_update_rate
+                )
+                # Sync expert_bias across TP ranks so all ranks have identical
+                # bias values (required because routing uses gather_output=True
+                # and all ranks must make the same top-k decisions).
+                torch.distributed.all_reduce(
+                    expert_bias,
+                    group=parallel_state.get_tensor_model_parallel_group(),
                 )
             # Reset accumulators for next step
             self.write_local_tokens_per_head.zero_()
@@ -1091,7 +1626,7 @@ class _EMASmoothFunc(torch.autograd.Function):
     def forward(
         ctx,
         x: Tensor,      # (B, S, H, D)
-        lam: Tensor,    # (B, H)
+        lam: Tensor,    # (H,)
         mask: Tensor,   # (B, S, H) bool
     ) -> Tensor:
         ctx.save_for_backward(x, lam, mask)
@@ -1117,7 +1652,7 @@ class _EMASmoothFunc(torch.autograd.Function):
 
 def ema_smooth(
     x: Tensor,      # (B, S, H, D)
-    lam: Tensor,    # (B, H)
+    lam: Tensor,    # (H,)
     mask: Tensor,   # (B, S, H) bool
 ) -> Tensor:        # (B, S, H, D)
     """EMA smoothing operator with memory-efficient recomputation backward.
@@ -1130,7 +1665,7 @@ def ema_smooth(
 
     Args:
         x:    (B, S, H, D) feature tensor to smooth.
-        lam:  (B, H) per-(batch, head) EMA decay in [0, 1].
+        lam:  (H) per-(batch, head) EMA decay in [0, 1].
         mask: (B, S, H) bool; True = commit / write gate open.
     Returns:
         y:    (B, S, H, D) smoothed output.

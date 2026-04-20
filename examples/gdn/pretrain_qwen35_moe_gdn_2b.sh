@@ -153,16 +153,18 @@ LINEAR_ATTN_ARGS=(
     --linear-key-head-dim 128
     --linear-value-head-dim 128
     
-    # --linear-conv-kernel-dim 4
+    --linear-conv-kernel-dim 4
     # --linear-num-key-heads 16
     # --linear-num-value-heads 16
 
-    --linear-num-shared-heads 4
+    --linear-num-shared-heads 8
     --linear-num-routed-heads 64
     --linear-write-topk 8
     --linear-read-topk 16
     --linear-write-coeff-for-read 0.5
     --linear-moe-router-enable-expert-bias
+
+    --moe-per-layer-logging
 )
 
 EFFICIENCY_ARGS=(
@@ -177,7 +179,7 @@ EFFICIENCY_ARGS=(
 
 CKPT_ARGS=(
     --ckpt-format "torch_dist"
-    --save-interval 8000
+    --save-interval 200
     # --no-save-optim
     # --no-load-optim
     --async-save
